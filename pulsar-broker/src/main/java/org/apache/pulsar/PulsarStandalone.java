@@ -19,15 +19,12 @@
 package org.apache.pulsar;
 
 import static org.apache.commons.lang3.StringUtils.isBlank;
-
 import com.beust.jcommander.Parameter;
 import com.google.common.collect.Sets;
-
 import java.io.File;
 import java.net.URL;
 import java.nio.file.Paths;
 import java.util.Optional;
-
 import org.apache.bookkeeper.conf.ServerConfiguration;
 import org.apache.pulsar.broker.PulsarService;
 import org.apache.pulsar.broker.ServiceConfiguration;
@@ -383,7 +380,7 @@ public class PulsarStandalone implements AutoCloseable {
                 admin.namespaces().setNamespaceReplicationClusters(defaultNamespace, Sets.newHashSet(config.getClusterName()));
             }
         } catch (PulsarAdminException e) {
-            log.info(e.getMessage());
+            log.info(e.getMessage(), e);
         }
     }
 
@@ -413,7 +410,7 @@ public class PulsarStandalone implements AutoCloseable {
                 admin.namespaces().createNamespace(namespace);
             }
         } catch (PulsarAdminException e) {
-            log.info(e.getMessage());
+            log.warn(e.getMessage(), e);
         }
     }
 
@@ -447,7 +444,7 @@ public class PulsarStandalone implements AutoCloseable {
                 bkEnsemble.stop();
             }
         } catch (Exception e) {
-            log.error("Shutdown failed: {}", e.getMessage());
+            log.error("Shutdown failed: {}", e.getMessage(), e);
         }
     }
 }

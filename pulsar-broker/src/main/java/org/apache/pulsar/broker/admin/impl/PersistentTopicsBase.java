@@ -20,11 +20,11 @@ package org.apache.pulsar.broker.admin.impl;
 
 import static org.apache.pulsar.broker.cache.ConfigurationCacheService.POLICIES;
 
+import org.apache.pulsar.common.policies.data.SubscribeRate;
 import static org.apache.pulsar.common.util.Codec.decode;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.github.zafarkhaja.semver.Version;
-import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
@@ -43,6 +43,7 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -57,6 +58,7 @@ import javax.ws.rs.core.StreamingOutput;
 
 import org.apache.bookkeeper.mledger.AsyncCallbacks;
 import org.apache.bookkeeper.mledger.AsyncCallbacks.ManagedLedgerInfoCallback;
+import org.apache.bookkeeper.mledger.LedgerOffloader;
 import org.apache.bookkeeper.mledger.ManagedLedgerException.MetadataNotFoundException;
 import org.apache.bookkeeper.mledger.Entry;
 import org.apache.bookkeeper.mledger.ManagedLedgerConfig;
@@ -95,10 +97,12 @@ import org.apache.pulsar.client.api.PulsarClientException;
 import org.apache.pulsar.client.impl.MessageIdImpl;
 import org.apache.pulsar.common.allocator.PulsarByteBufAllocator;
 import org.apache.pulsar.common.naming.PartitionedManagedLedgerInfo;
+import org.apache.pulsar.common.policies.data.DispatchRate;
+import org.apache.pulsar.common.policies.data.InactiveTopicPolicies;
 import org.apache.pulsar.common.policies.data.PersistencePolicies;
-import org.apache.pulsar.common.policies.data.PolicyName;
-import org.apache.pulsar.common.policies.data.PolicyOperation;
+import org.apache.pulsar.common.policies.data.OffloadPolicies;
 import org.apache.pulsar.common.policies.data.DelayedDeliveryPolicies;
+import org.apache.pulsar.common.policies.data.PublishRate;
 import org.apache.pulsar.common.protocol.Commands;
 import org.apache.pulsar.common.api.proto.PulsarApi.CommandSubscribe.InitialPosition;
 import org.apache.pulsar.common.api.proto.PulsarApi.KeyValue;
@@ -122,6 +126,7 @@ import org.apache.pulsar.common.policies.data.TopicPolicies;
 import org.apache.pulsar.common.policies.data.TopicStats;
 import org.apache.pulsar.common.util.DateFormatter;
 import org.apache.pulsar.common.util.FutureUtil;
+import org.apache.pulsar.common.util.collections.BitSetRecyclable;
 import org.apache.zookeeper.KeeperException;
 import org.apache.zookeeper.data.Stat;
 import org.slf4j.Logger;
@@ -370,11 +375,11 @@ public class PersistentTopicsBase extends AdminResource {
         grantPermissions(topicName.toString(), role, actions);
     }
 
-    protected void internalDeleteTopicForcefully(boolean authoritative) {
+    protected void internalDeleteTopicForcefully(boolean authoritative, boolean deleteSchema) {
         validateWriteOperationOnTopic(authoritative);
 
         try {
-            pulsar().getBrokerService().deleteTopic(topicName.toString(), true).get();
+            pulsar().getBrokerService().deleteTopic(topicName.toString(), true, deleteSchema).get();
         } catch (Exception e) {
             if (e.getCause() instanceof MetadataNotFoundException) {
                 log.info("[{}] Topic was already not existing {}", clientAppId(), topicName, e);
@@ -626,7 +631,8 @@ public class PersistentTopicsBase extends AdminResource {
         return metadata;
     }
 
-    protected void internalDeletePartitionedTopic(AsyncResponse asyncResponse, boolean authoritative, boolean force) {
+    protected void internalDeletePartitionedTopic(AsyncResponse asyncResponse, boolean authoritative,
+                                                  boolean force, boolean deleteSchema) {
         try {
             validateWriteOperationOnTopic(authoritative);
         } catch (WebApplicationException wae) {
@@ -646,6 +652,18 @@ public class PersistentTopicsBase extends AdminResource {
             final int numPartitions = partitionMeta.partitions;
             if (numPartitions > 0) {
                 final AtomicInteger count = new AtomicInteger(numPartitions);
+                if (deleteSchema) {
+                    count.incrementAndGet();
+                    pulsar().getBrokerService().deleteSchemaStorage(topicName.getPartition(0).toString())
+                            .whenComplete((r, ex) -> {
+                                if (ex != null) {
+                                    log.warn("Failed to delete schema storage of topic: {}", topicName);
+                                }
+                                if (count.decrementAndGet() == 0) {
+                                    future.complete(null);
+                                }
+                            });
+                }
                 for (int i = 0; i < numPartitions; i++) {
                     TopicName topicNamePartition = topicName.getPartition(i);
                     try {
@@ -801,7 +819,91 @@ public class PersistentTopicsBase extends AdminResource {
         }
     }
 
+    protected CompletableFuture<Void> internalSetOffloadPolicies(OffloadPolicies offloadPolicies) {
+        TopicPolicies topicPolicies = null;
+        try {
+            topicPolicies = pulsar().getTopicPoliciesService().getTopicPolicies(topicName);
+        } catch (BrokerServiceException.TopicPoliciesCacheNotInitException e) {
+            log.error("Topic {} policies cache have not init.", topicName);
+            throw new RestException(Status.PRECONDITION_FAILED, "Policies cache have not init");
+        }
+        if (topicPolicies == null) {
+            topicPolicies = new TopicPolicies();
+        }
+        topicPolicies.setOffloadPolicies(offloadPolicies);
+        CompletableFuture<Void> completableFuture = new CompletableFuture<>();
+        pulsar().getTopicPoliciesService().updateTopicPoliciesAsync(topicName, topicPolicies)
+                .thenCompose((res) -> {
+                    //The policy update is asynchronous. Cache at this step may not be updated yet.
+                    //So we need to set the loader by the incoming offloadPolicies instead of topic policies cache.
+                    PartitionedTopicMetadata metadata = fetchPartitionedTopicMetadata(pulsar(), topicName);
+                    if (metadata.partitions > 0) {
+                        List<CompletableFuture<Void>> futures = new ArrayList<>(metadata.partitions);
+                        for (int i = 0; i < metadata.partitions; i++) {
+                            futures.add(internalUpdateOffloadPolicies(offloadPolicies, topicName.getPartition(i)));
+                        }
+                        return FutureUtil.waitForAll(futures);
+                    } else {
+                        return internalUpdateOffloadPolicies(offloadPolicies, topicName);
+                    }
+                })
+                .whenComplete((result, e) -> {
+                    if (e != null) {
+                        completableFuture.completeExceptionally(e);
+                    } else {
+                        completableFuture.complete(null);
+                    }
+                });
+        return completableFuture;
+    }
+
+    protected CompletableFuture<Void> internalSetInactiveTopicPolicies(InactiveTopicPolicies inactiveTopicPolicies) {
+        TopicPolicies topicPolicies = null;
+        try {
+            topicPolicies = pulsar().getTopicPoliciesService().getTopicPolicies(topicName);
+        } catch (BrokerServiceException.TopicPoliciesCacheNotInitException e) {
+            log.error("Topic {} policies cache have not init.", topicName);
+            return FutureUtil.failedFuture(new RestException(Status.PRECONDITION_FAILED, "Policies cache have not init"));
+        }
+        if (topicPolicies == null) {
+            topicPolicies = new TopicPolicies();
+        }
+        topicPolicies.setInactiveTopicPolicies(inactiveTopicPolicies);
+        return pulsar().getTopicPoliciesService().updateTopicPoliciesAsync(topicName, topicPolicies);
+    }
+
+    private CompletableFuture<Void> internalUpdateOffloadPolicies(OffloadPolicies offloadPolicies, TopicName topicName) {
+        return pulsar().getBrokerService().getTopicIfExists(topicName.toString())
+                .thenAccept(optionalTopic -> {
+            try {
+                if (!optionalTopic.isPresent() || !topicName.isPersistent()) {
+                    return;
+                }
+                PersistentTopic persistentTopic = (PersistentTopic) optionalTopic.get();
+                ManagedLedgerConfig managedLedgerConfig = persistentTopic.getManagedLedger().getConfig();
+                if (offloadPolicies == null) {
+                    LedgerOffloader namespaceOffloader = pulsar().getLedgerOffloaderMap().get(topicName.getNamespaceObject());
+                    LedgerOffloader topicOffloader = managedLedgerConfig.getLedgerOffloader();
+                    if (topicOffloader != null && topicOffloader != namespaceOffloader) {
+                        topicOffloader.close();
+                    }
+                    managedLedgerConfig.setLedgerOffloader(namespaceOffloader);
+                } else {
+                    managedLedgerConfig.setLedgerOffloader(pulsar().createManagedLedgerOffloader(offloadPolicies));
+                }
+                persistentTopic.getManagedLedger().setConfig(managedLedgerConfig);
+            } catch (PulsarServerException e) {
+                throw new RestException(e);
+            }
+        });
+    }
+
     protected CompletableFuture<Void> internalSetMaxUnackedMessagesOnSubscription(Integer maxUnackedNum) {
+        if (maxUnackedNum != null && maxUnackedNum < 0) {
+            throw new RestException(Status.PRECONDITION_FAILED,
+                    "maxUnackedNum must be 0 or more");
+        }
+
         TopicPolicies topicPolicies = null;
         try {
             topicPolicies = pulsar().getTopicPoliciesService().getTopicPolicies(topicName);
@@ -817,6 +919,11 @@ public class PersistentTopicsBase extends AdminResource {
     }
 
     protected CompletableFuture<Void> internalSetMaxUnackedMessagesOnConsumer(Integer maxUnackedNum) {
+        if (maxUnackedNum != null && maxUnackedNum < 0) {
+            throw new RestException(Status.PRECONDITION_FAILED,
+                    "maxUnackedNum must be 0 or more");
+        }
+
         TopicPolicies topicPolicies = null;
         try {
             topicPolicies = pulsar().getTopicPoliciesService().getTopicPolicies(topicName);
@@ -829,6 +936,16 @@ public class PersistentTopicsBase extends AdminResource {
         }
         topicPolicies.setMaxUnackedMessagesOnConsumer(maxUnackedNum);
         return pulsar().getTopicPoliciesService().updateTopicPoliciesAsync(topicName, topicPolicies);
+    }
+
+    protected CompletableFuture<Void> internalSetDeduplicationSnapshotInterval(Integer interval) {
+        if (interval != null && interval < 0) {
+            throw new RestException(Status.PRECONDITION_FAILED, "interval must be 0 or more");
+        }
+        TopicPolicies policies = getTopicPolicies(topicName).orElseGet(TopicPolicies::new);
+        policies.setDeduplicationSnapshotIntervalSeconds(interval);
+        return pulsar().getTopicPoliciesService().updateTopicPoliciesAsync(topicName, policies);
+
     }
 
     private void internalUnloadNonPartitionedTopic(AsyncResponse asyncResponse, boolean authoritative) {
@@ -854,19 +971,19 @@ public class PersistentTopicsBase extends AdminResource {
         });
     }
 
-    protected void internalDeleteTopic(boolean authoritative, boolean force) {
+    protected void internalDeleteTopic(boolean authoritative, boolean force, boolean deleteSchema) {
         if (force) {
-            internalDeleteTopicForcefully(authoritative);
+            internalDeleteTopicForcefully(authoritative, deleteSchema);
         } else {
-            internalDeleteTopic(authoritative);
+            internalDeleteTopic(authoritative, deleteSchema);
         }
     }
 
-    protected void internalDeleteTopic(boolean authoritative) {
+    protected void internalDeleteTopic(boolean authoritative, boolean deleteSchema) {
         validateWriteOperationOnTopic(authoritative);
 
         try {
-            pulsar().getBrokerService().deleteTopic(topicName.toString(), false).get();
+            pulsar().getBrokerService().deleteTopic(topicName.toString(), false, deleteSchema).get();
             log.info("[{}] Successfully removed topic {}", clientAppId(), topicName);
         } catch (Exception e) {
             Throwable t = e.getCause();
@@ -970,14 +1087,19 @@ public class PersistentTopicsBase extends AdminResource {
         return topic.getStats(getPreciseBacklog);
     }
 
-    protected PersistentTopicInternalStats internalGetInternalStats(boolean authoritative) {
+    protected PersistentTopicInternalStats internalGetInternalStats(boolean authoritative, boolean metadata) {
         validateAdminAndClientPermission();
         if (topicName.isGlobal()) {
             validateGlobalNamespaceOwnership(namespaceName);
         }
         validateTopicOwnership(topicName, authoritative);
         Topic topic = getTopicReference(topicName);
-        return topic.getInternalStats();
+        try {
+            boolean includeMetadata = metadata && hasSuperUserAccess();
+            return topic.getInternalStats(includeMetadata).get();
+        } catch (Exception e) {
+            throw new RestException(Status.INTERNAL_SERVER_ERROR, (e instanceof ExecutionException) ? e.getCause().getMessage() : e.getMessage());
+        }
     }
 
     protected void internalGetManagedLedgerInfo(AsyncResponse asyncResponse, boolean authoritative) {
@@ -1168,7 +1290,7 @@ public class PersistentTopicsBase extends AdminResource {
             for (int i = 0; i < partitionMetadata.partitions; i++) {
                 try {
                     topicStatsFutureList.add(pulsar().getAdminClient().topics()
-                            .getInternalStatsAsync((topicName.getPartition(i).toString())));
+                            .getInternalStatsAsync((topicName.getPartition(i).toString()), false));
                 } catch (PulsarServerException e) {
                     asyncResponse.resume(new RestException(e));
                     return;
@@ -1495,11 +1617,11 @@ public class PersistentTopicsBase extends AdminResource {
             if (subName.startsWith(topic.getReplicatorPrefix())) {
                 String remoteCluster = PersistentReplicator.getRemoteCluster(subName);
                 PersistentReplicator repl = (PersistentReplicator) topic.getPersistentReplicator(remoteCluster);
-                Preconditions.checkNotNull(repl);
+                checkNotNull(repl);
                 repl.skipMessages(numMessages).get();
             } else {
                 PersistentSubscription sub = topic.getSubscription(subName);
-                Preconditions.checkNotNull(sub);
+                checkNotNull(sub);
                 sub.skipMessages(numMessages).get();
             }
             log.info("[{}] Skipped {} messages on {} {}", clientAppId(), numMessages, topicName, subName);
@@ -1894,7 +2016,7 @@ public class PersistentTopicsBase extends AdminResource {
     }
 
     protected void internalResetCursorOnPosition(AsyncResponse asyncResponse, String subName, boolean authoritative,
-            MessageIdImpl messageId) {
+            MessageIdImpl messageId, boolean isExcluded, int batchIndex) {
         if (topicName.isGlobal()) {
             try {
                 validateGlobalNamespaceOwnership(namespaceName);
@@ -1918,6 +2040,8 @@ public class PersistentTopicsBase extends AdminResource {
             return;
         } else {
             validateAdminAccessForSubscriber(subName, authoritative);
+            // will redirect if the topic not owned by current broker
+            validateReadOperationOnTopic(authoritative);
             PersistentTopic topic = (PersistentTopic) getTopicReference(topicName);
             if (topic == null) {
                 asyncResponse.resume(new RestException(Status.NOT_FOUND, "Topic not found"));
@@ -1925,34 +2049,109 @@ public class PersistentTopicsBase extends AdminResource {
             }
             try {
                 PersistentSubscription sub = topic.getSubscription(subName);
-                Preconditions.checkNotNull(sub);
-                sub.resetCursor(PositionImpl.get(messageId.getLedgerId(), messageId.getEntryId())).thenRun(() -> {
-                    log.info("[{}][{}] successfully reset cursor on subscription {} to position {}", clientAppId(),
-                            topicName, subName, messageId);
-                    asyncResponse.resume(Response.noContent().build());
-                }).exceptionally(ex -> {
-                    Throwable t = (ex instanceof CompletionException ? ex.getCause() : ex);
-                    log.warn("[{}][{}] Failed to reset cursor on subscription {} to position {}", clientAppId(),
-                            topicName, subName, messageId, t);
-                    if (t instanceof SubscriptionInvalidCursorPosition) {
-                        asyncResponse.resume(new RestException(Status.PRECONDITION_FAILED,
-                                "Unable to find position for position specified: " + t.getMessage()));
-                    } else if (t instanceof SubscriptionBusyException) {
-                        asyncResponse.resume(new RestException(Status.PRECONDITION_FAILED,
-                                "Failed for Subscription Busy: " + t.getMessage()));
-                    } else {
-                        resumeAsyncResponseExceptionally(asyncResponse, t);
+                if (sub == null) {
+                    asyncResponse.resume(new RestException(Status.NOT_FOUND, "Subscription not found"));
+                    return;
+                }
+                CompletableFuture<Integer> batchSizeFuture = new CompletableFuture<>();
+                if (batchIndex >= 0) {
+                    try {
+                        ManagedLedgerImpl ledger = (ManagedLedgerImpl) topic.getManagedLedger();
+                        ledger.asyncReadEntry(new PositionImpl(messageId.getLedgerId(), messageId.getEntryId()), new AsyncCallbacks.ReadEntryCallback() {
+                            @Override
+                            public void readEntryFailed(ManagedLedgerException exception, Object ctx) {
+                                // Since we can't read the message from the storage layer, it might be an already delete message ID or an invalid message ID
+                                // We should fall back to non batch index seek.
+                                batchSizeFuture.complete(0);
+                            }
+
+                            @Override
+                            public void readEntryComplete(Entry entry, Object ctx) {
+                                try {
+                                    try {
+                                        if (entry == null) {
+                                            batchSizeFuture.complete(0);
+                                        } else {
+                                            MessageMetadata metadata = Commands.parseMessageMetadata(entry.getDataBuffer());
+                                            batchSizeFuture.complete(metadata.getNumMessagesInBatch());
+                                        }
+                                    } catch (Exception e) {
+                                        batchSizeFuture.completeExceptionally(new RestException(e));
+                                    }
+                                } finally {
+                                    if (entry != null) {
+                                        entry.release();
+                                    }
+                                }
+                            }
+                        }, null);
+                    } catch (NullPointerException npe) {
+                        batchSizeFuture.completeExceptionally(new RestException(Status.NOT_FOUND, "Message not found"));
+                    } catch (Exception exception) {
+                        log.error("[{}] Failed to get message with ledgerId {} entryId {} from {}",
+                                clientAppId(), messageId.getLedgerId(), messageId.getEntryId(), topicName, exception);
+                        batchSizeFuture.completeExceptionally(new RestException(exception));
                     }
+                } else {
+                    batchSizeFuture.complete(0);
+                }
+                batchSizeFuture.thenAccept(bi -> {
+                    PositionImpl seekPosition;
+                    if (bi > 0) {
+                        long[] ackSet;
+                        BitSetRecyclable bitSet = BitSetRecyclable.create();
+                        bitSet.set(0, bi);
+                        if (isExcluded) {
+                            bitSet.clear(0, Math.max(batchIndex + 1, 0));
+                            if (bitSet.length() > 0) {
+                                ackSet = bitSet.toLongArray();
+                                seekPosition = PositionImpl.get(messageId.getLedgerId(), messageId.getEntryId(), ackSet);
+                            } else {
+                                seekPosition = PositionImpl.get(messageId.getLedgerId(), messageId.getEntryId());
+                                seekPosition = seekPosition.getNext();
+                            }
+                        } else {
+                            if (batchIndex - 1 >= 0) {
+                                bitSet.clear(0, batchIndex);
+                                ackSet = bitSet.toLongArray();
+                                seekPosition = PositionImpl.get(messageId.getLedgerId(), messageId.getEntryId(), ackSet);
+                            } else {
+                                seekPosition = PositionImpl.get(messageId.getLedgerId(), messageId.getEntryId());
+                            }
+                        }
+                        bitSet.recycle();
+                    } else {
+                        seekPosition = PositionImpl.get(messageId.getLedgerId(), messageId.getEntryId());
+                        seekPosition = isExcluded ? seekPosition.getNext() : seekPosition;
+                    }
+
+                    sub.resetCursor(seekPosition).thenRun(() -> {
+                        log.info("[{}][{}] successfully reset cursor on subscription {} to position {}", clientAppId(),
+                                topicName, subName, messageId);
+                        asyncResponse.resume(Response.noContent().build());
+                    }).exceptionally(ex -> {
+                        Throwable t = (ex instanceof CompletionException ? ex.getCause() : ex);
+                        log.warn("[{}][{}] Failed to reset cursor on subscription {} to position {}", clientAppId(),
+                                topicName, subName, messageId, t);
+                        if (t instanceof SubscriptionInvalidCursorPosition) {
+                            asyncResponse.resume(new RestException(Status.PRECONDITION_FAILED,
+                                    "Unable to find position for position specified: " + t.getMessage()));
+                        } else if (t instanceof SubscriptionBusyException) {
+                            asyncResponse.resume(new RestException(Status.PRECONDITION_FAILED,
+                                    "Failed for Subscription Busy: " + t.getMessage()));
+                        } else {
+                            resumeAsyncResponseExceptionally(asyncResponse, t);
+                        }
+                        return null;
+                    });
+                }).exceptionally(e -> {
+                    asyncResponse.resume(e);
                     return null;
                 });
             } catch (Exception e) {
                 log.warn("[{}][{}] Failed to reset cursor on subscription {} to position {}", clientAppId(), topicName,
                         subName, messageId, e);
-                if (e instanceof NullPointerException) {
-                    asyncResponse.resume(new RestException(Status.NOT_FOUND, "Subscription not found"));
-                } else {
-                    resumeAsyncResponseExceptionally(asyncResponse, e);
-                }
+                resumeAsyncResponseExceptionally(asyncResponse, e);
             }
         }
     }
@@ -2003,7 +2202,7 @@ public class PersistentTopicsBase extends AdminResource {
             log.error("[{}] Not supported operation of non-persistent topic {} {}", clientAppId(), topicName,
                     subName);
             throw new RestException(Status.METHOD_NOT_ALLOWED,
-                    "Skip messages on a non-persistent topic is not allowed");
+                    "Peek messages on a non-persistent topic is not allowed");
         }
 
         PersistentTopic topic = (PersistentTopic) getTopicReference(topicName);
@@ -2025,13 +2224,63 @@ public class PersistentTopicsBase extends AdminResource {
         } catch (NullPointerException npe) {
             throw new RestException(Status.NOT_FOUND, "Message not found");
         } catch (Exception exception) {
-            log.error("[{}] Failed to get message at position {} from {} {}", clientAppId(), messagePosition,
+            log.error("[{}] Failed to peek message at position {} from {} {}", clientAppId(), messagePosition,
                     topicName, subName, exception);
             throw new RestException(exception);
         } finally {
             if (entry != null) {
                 entry.release();
             }
+        }
+    }
+
+    protected Response internalExamineMessage(String initialPosition, long messagePosition, boolean authoritative) {
+        if (topicName.isGlobal()) {
+            validateGlobalNamespaceOwnership(namespaceName);
+        }
+
+        if (!topicName.isPartitioned() && getPartitionedTopicMetadata(topicName, authoritative, false).partitions > 0) {
+            throw new RestException(Status.METHOD_NOT_ALLOWED, "Examine messages on a partitioned topic is not allowed, " +
+                    "please try examine message on specific topic partition");
+        }
+        validateTopicOwnership(topicName, authoritative);
+        if (!(getTopicReference(topicName) instanceof PersistentTopic)) {
+            log.error("[{}] Not supported operation of non-persistent topic {} ", clientAppId(), topicName);
+            throw new RestException(Status.METHOD_NOT_ALLOWED, "Examine messages on a non-persistent topic is not allowed");
+        }
+
+        if (messagePosition < 1) {
+            messagePosition = 1;
+        }
+
+        if (null == initialPosition) {
+            initialPosition = "latest";
+        }
+
+        try {
+            PersistentTopic topic = (PersistentTopic) getTopicReference(topicName);
+            long totalMessage = topic.getNumberOfEntries();
+            PositionImpl startPosition = topic.getFirstPosition();
+            long messageToSkip = initialPosition.equals("earliest")? messagePosition : totalMessage - messagePosition + 1;
+            CompletableFuture<Entry> future = new CompletableFuture<>();
+            PositionImpl readPosition = topic.getPositionAfterN(startPosition, messageToSkip);
+            topic.asyncReadEntry(readPosition, new AsyncCallbacks.ReadEntryCallback() {
+                @Override
+                public void readEntryComplete(Entry entry, Object ctx) {
+                    future.complete(entry);
+                }
+
+                @Override
+                public void readEntryFailed(ManagedLedgerException exception, Object ctx) {
+                    future.completeExceptionally(exception);
+                }
+            }, null);
+            return generateResponseWithEntry(future.get());
+        } catch (Exception exception) {
+            exception.printStackTrace();
+            log.error("[{}] Failed to examine message at position {} from {} due to {}", clientAppId(), messagePosition,
+                    topicName , exception);
+            throw new RestException(exception);
         }
     }
 
@@ -2046,7 +2295,7 @@ public class PersistentTopicsBase extends AdminResource {
     }
 
     private Response generateResponseWithEntry(Entry entry) throws IOException {
-        Preconditions.checkNotNull(entry);
+        checkNotNull(entry);
         PositionImpl pos = (PositionImpl) entry.getPosition();
         ByteBuf metadataAndPayload = entry.getDataBuffer();
 
@@ -2189,9 +2438,24 @@ public class PersistentTopicsBase extends AdminResource {
                 });
     }
 
+    protected CompletableFuture<Void> internalSetDeduplicationEnabled(Boolean enabled) {
+        TopicPolicies topicPolicies = null;
+        try {
+            topicPolicies = pulsar().getTopicPoliciesService().getTopicPolicies(topicName);
+        } catch (BrokerServiceException.TopicPoliciesCacheNotInitException e) {
+            log.error("Topic {} policies cache have not init.", topicName);
+            throw new RestException(Status.PRECONDITION_FAILED, "Policies cache have not init");
+        }
+        if (topicPolicies == null) {
+            topicPolicies = new TopicPolicies();
+        }
+        topicPolicies.setDeduplicationEnabled(enabled);
+        return pulsar().getTopicPoliciesService().updateTopicPoliciesAsync(topicName, topicPolicies);
+    }
+
     protected void internalSetMessageTTL(AsyncResponse asyncResponse, Integer ttlInSecond) {
         //Validate message ttl value.
-        if (ttlInSecond != null && ttlInSecond.intValue() < 0) {
+        if (ttlInSecond != null && ttlInSecond < 0) {
             throw new RestException(Status.PRECONDITION_FAILED, "Invalid value for message TTL");
         }
         validateAdminAccessForTenant(namespaceName.getTenant());
@@ -2310,19 +2574,14 @@ public class PersistentTopicsBase extends AdminResource {
         return pulsar().getTopicPoliciesService().updateTopicPoliciesAsync(topicName, topicPolicies.get());
     }
 
-    protected void internalGetPersistence(AsyncResponse asyncResponse){
+    protected Optional<PersistencePolicies> internalGetPersistence(){
         validateAdminAccessForTenant(namespaceName.getTenant());
         validatePoliciesReadOnlyAccess();
         if (topicName.isGlobal()) {
             validateGlobalNamespaceOwnership(namespaceName);
         }
-        Optional<PersistencePolicies> persistencePolicies = getTopicPolicies(topicName)
-                .map(TopicPolicies::getPersistence);
-        if (!persistencePolicies.isPresent()) {
-            asyncResponse.resume(Response.noContent().build());
-        }else {
-            asyncResponse.resume(persistencePolicies.get());
-        }
+        checkTopicLevelPolicyEnable();
+        return getTopicPolicies(topicName).map(TopicPolicies::getPersistence);
     }
 
     protected CompletableFuture<Void> internalSetPersistence(PersistencePolicies persistencePolicies) {
@@ -2331,6 +2590,7 @@ public class PersistentTopicsBase extends AdminResource {
         if (topicName.isGlobal()) {
             validateGlobalNamespaceOwnership(namespaceName);
         }
+        checkTopicLevelPolicyEnable();
         validatePersistencePolicies(persistencePolicies);
 
         TopicPolicies topicPolicies = getTopicPolicies(topicName).orElseGet(TopicPolicies::new);
@@ -2344,11 +2604,98 @@ public class PersistentTopicsBase extends AdminResource {
         if (topicName.isGlobal()) {
             validateGlobalNamespaceOwnership(namespaceName);
         }
+        checkTopicLevelPolicyEnable();
         Optional<TopicPolicies> topicPolicies = getTopicPolicies(topicName);
         if (!topicPolicies.isPresent()) {
             return CompletableFuture.completedFuture(null);
         }
         topicPolicies.get().setPersistence(null);
+        return pulsar().getTopicPoliciesService().updateTopicPoliciesAsync(topicName, topicPolicies.get());
+    }
+
+    protected Optional<Integer> internalGetMaxProducers() {
+        validateAdminAccessForTenant(namespaceName.getTenant());
+        validatePoliciesReadOnlyAccess();
+        if (topicName.isGlobal()) {
+            validateGlobalNamespaceOwnership(namespaceName);
+        }
+        checkTopicLevelPolicyEnable();
+        return getTopicPolicies(topicName).map(TopicPolicies::getMaxProducerPerTopic);
+    }
+
+    protected CompletableFuture<Void> internalSetMaxProducers(Integer maxProducers) {
+        if (maxProducers != null && maxProducers < 0) {
+            throw new RestException(Status.PRECONDITION_FAILED,
+                    "maxProducers must be 0 or more");
+        }
+
+        validateAdminAccessForTenant(namespaceName.getTenant());
+        validatePoliciesReadOnlyAccess();
+        if (topicName.isGlobal()) {
+            validateGlobalNamespaceOwnership(namespaceName);
+        }
+        checkTopicLevelPolicyEnable();
+
+        TopicPolicies topicPolicies = getTopicPolicies(topicName).orElseGet(TopicPolicies::new);
+        topicPolicies.setMaxProducerPerTopic(maxProducers);
+        return pulsar().getTopicPoliciesService().updateTopicPoliciesAsync(topicName, topicPolicies);
+    }
+
+    protected CompletableFuture<Void> internalRemoveMaxProducers() {
+        validateAdminAccessForTenant(namespaceName.getTenant());
+        validatePoliciesReadOnlyAccess();
+        if (topicName.isGlobal()) {
+            validateGlobalNamespaceOwnership(namespaceName);
+        }
+        checkTopicLevelPolicyEnable();
+        Optional<TopicPolicies> topicPolicies = getTopicPolicies(topicName);
+        if (!topicPolicies.isPresent()) {
+            return CompletableFuture.completedFuture(null);
+        }
+        topicPolicies.get().setMaxProducerPerTopic(null);
+        return pulsar().getTopicPoliciesService().updateTopicPoliciesAsync(topicName, topicPolicies.get());
+    }
+
+    protected Optional<Integer> internalGetMaxConsumers() {
+        validateAdminAccessForTenant(namespaceName.getTenant());
+        validatePoliciesReadOnlyAccess();
+        if (topicName.isGlobal()) {
+            validateGlobalNamespaceOwnership(namespaceName);
+        }
+        checkTopicLevelPolicyEnable();
+        return getTopicPolicies(topicName).map(TopicPolicies::getMaxConsumerPerTopic);
+    }
+
+    protected CompletableFuture<Void> internalSetMaxConsumers(Integer maxConsumers) {
+        if (maxConsumers != null && maxConsumers < 0) {
+            throw new RestException(Status.PRECONDITION_FAILED,
+                    "maxConsumers must be 0 or more");
+        }
+
+        validateAdminAccessForTenant(namespaceName.getTenant());
+        validatePoliciesReadOnlyAccess();
+        if (topicName.isGlobal()) {
+            validateGlobalNamespaceOwnership(namespaceName);
+        }
+        checkTopicLevelPolicyEnable();
+
+        TopicPolicies topicPolicies = getTopicPolicies(topicName).orElseGet(TopicPolicies::new);
+        topicPolicies.setMaxConsumerPerTopic(maxConsumers);
+        return pulsar().getTopicPoliciesService().updateTopicPoliciesAsync(topicName, topicPolicies);
+    }
+
+    protected CompletableFuture<Void> internalRemoveMaxConsumers() {
+        validateAdminAccessForTenant(namespaceName.getTenant());
+        validatePoliciesReadOnlyAccess();
+        if (topicName.isGlobal()) {
+            validateGlobalNamespaceOwnership(namespaceName);
+        }
+        checkTopicLevelPolicyEnable();
+        Optional<TopicPolicies> topicPolicies = getTopicPolicies(topicName);
+        if (!topicPolicies.isPresent()) {
+            return CompletableFuture.completedFuture(null);
+        }
+        topicPolicies.get().setMaxConsumerPerTopic(null);
         return pulsar().getTopicPoliciesService().updateTopicPoliciesAsync(topicName, topicPolicies.get());
     }
 
@@ -2509,11 +2856,11 @@ public class PersistentTopicsBase extends AdminResource {
             if (subName.startsWith(topic.getReplicatorPrefix())) {
                 String remoteCluster = PersistentReplicator.getRemoteCluster(subName);
                 PersistentReplicator repl = (PersistentReplicator) topic.getPersistentReplicator(remoteCluster);
-                Preconditions.checkNotNull(repl);
+                checkNotNull(repl);
                 repl.expireMessages(expireTimeInSeconds);
             } else {
                 PersistentSubscription sub = topic.getSubscription(subName);
-                Preconditions.checkNotNull(sub);
+                checkNotNull(sub);
                 sub.expireMessages(expireTimeInSeconds);
             }
             log.info("[{}] Message expire started up to {} on {} {}", clientAppId(), expireTimeInSeconds, topicName,
@@ -2664,9 +3011,6 @@ public class PersistentTopicsBase extends AdminResource {
                 throw ex;
             }
 
-            String path = path(PARTITIONED_TOPIC_PATH_ZNODE, topicName.getNamespace(), topicName.getDomain().toString(),
-                    topicName.getEncodedLocalName());
-
             // validates global-namespace contains local/peer cluster: if peer/local cluster present then lookup can
             // serve/redirect request else fail partitioned-metadata-request so, client fails while creating
             // producer/consumer
@@ -2695,9 +3039,6 @@ public class PersistentTopicsBase extends AdminResource {
     public static CompletableFuture<PartitionedTopicMetadata> unsafeGetPartitionedTopicMetadataAsync(
         PulsarService pulsar, TopicName topicName) {
         CompletableFuture<PartitionedTopicMetadata> metadataFuture = new CompletableFuture();
-
-        String path = path(PARTITIONED_TOPIC_PATH_ZNODE, topicName.getNamespace(),
-            topicName.getDomain().toString(), topicName.getEncodedLocalName());
 
         // validates global-namespace contains local/peer cluster: if peer/local cluster present then lookup can
         // serve/redirect request else fail partitioned-metadata-request so, client fails while creating
@@ -2762,7 +3103,11 @@ public class PersistentTopicsBase extends AdminResource {
     private Subscription getSubscriptionReference(String subName, PersistentTopic topic) {
         try {
             Subscription sub = topic.getSubscription(subName);
-            return Preconditions.checkNotNull(sub);
+            if (sub == null) {
+                sub = topic.createSubscription(subName, InitialPosition.Earliest, false).get();
+            }
+
+            return checkNotNull(sub);
         } catch (Exception e) {
             throw new RestException(Status.NOT_FOUND, "Subscription not found");
         }
@@ -2775,7 +3120,7 @@ public class PersistentTopicsBase extends AdminResource {
         try {
             String remoteCluster = PersistentReplicator.getRemoteCluster(replName);
             PersistentReplicator repl = (PersistentReplicator) topic.getPersistentReplicator(remoteCluster);
-            return Preconditions.checkNotNull(repl);
+            return checkNotNull(repl);
         } catch (Exception e) {
             throw new RestException(Status.NOT_FOUND, "Replicator not found");
         }
@@ -2816,7 +3161,6 @@ public class PersistentTopicsBase extends AdminResource {
      *            : number partitions for the topics
      */
     private CompletableFuture<Void> createSubscriptions(TopicName topicName, int numPartitions) {
-        String path = path(PARTITIONED_TOPIC_PATH_ZNODE, topicName.getPersistenceNamingEncoding());
         CompletableFuture<Void> result = new CompletableFuture<>();
         pulsar().getBrokerService().fetchPartitionedTopicMetadataAsync(topicName).thenAccept(partitionMetadata -> {
             if (partitionMetadata.partitions < 1) {
@@ -3041,4 +3385,257 @@ public class PersistentTopicsBase extends AdminResource {
         });
 
     }
+
+    protected Optional<DispatchRate> internalGetDispatchRate() {
+        validateAdminAccessForTenant(namespaceName.getTenant());
+        validatePoliciesReadOnlyAccess();
+        if (topicName.isGlobal()) {
+            validateGlobalNamespaceOwnership(namespaceName);
+        }
+        checkTopicLevelPolicyEnable();
+        return getTopicPolicies(topicName).map(TopicPolicies::getDispatchRate);
+    }
+
+    protected CompletableFuture<Void> internalSetDispatchRate(DispatchRate dispatchRate) {
+        validateAdminAccessForTenant(namespaceName.getTenant());
+        validatePoliciesReadOnlyAccess();
+        if (topicName.isGlobal()) {
+            validateGlobalNamespaceOwnership(namespaceName);
+        }
+        checkTopicLevelPolicyEnable();
+        if (dispatchRate == null) {
+            return CompletableFuture.completedFuture(null);
+        }
+        TopicPolicies topicPolicies = getTopicPolicies(topicName)
+            .orElseGet(TopicPolicies::new);
+        topicPolicies.setDispatchRate(dispatchRate);
+        return pulsar().getTopicPoliciesService().updateTopicPoliciesAsync(topicName, topicPolicies);
+    }
+
+    protected CompletableFuture<Void> internalRemoveDispatchRate() {
+        validateAdminAccessForTenant(namespaceName.getTenant());
+        validatePoliciesReadOnlyAccess();
+        if (topicName.isGlobal()) {
+            validateGlobalNamespaceOwnership(namespaceName);
+        }
+        checkTopicLevelPolicyEnable();
+        Optional<TopicPolicies> topicPolicies = getTopicPolicies(topicName);
+        if (!topicPolicies.isPresent()) {
+            return CompletableFuture.completedFuture(null);
+        }
+        topicPolicies.get().setDispatchRate(null);
+        return pulsar().getTopicPoliciesService().updateTopicPoliciesAsync(topicName, topicPolicies.get());
+
+    }
+
+    protected Optional<DispatchRate> internalGetSubscriptionDispatchRate() {
+        validateAdminAccessForTenant(namespaceName.getTenant());
+        validatePoliciesReadOnlyAccess();
+        if (topicName.isGlobal()) {
+            validateGlobalNamespaceOwnership(namespaceName);
+        }
+        checkTopicLevelPolicyEnable();
+        return getTopicPolicies(topicName).map(TopicPolicies::getSubscriptionDispatchRate);
+    }
+
+    protected CompletableFuture<Void> internalSetSubscriptionDispatchRate(DispatchRate dispatchRate) {
+        validateAdminAccessForTenant(namespaceName.getTenant());
+        validatePoliciesReadOnlyAccess();
+        if (topicName.isGlobal()) {
+            validateGlobalNamespaceOwnership(namespaceName);
+        }
+        checkTopicLevelPolicyEnable();
+        if (dispatchRate == null) {
+            return CompletableFuture.completedFuture(null);
+        }
+        TopicPolicies topicPolicies = getTopicPolicies(topicName)
+            .orElseGet(TopicPolicies::new);
+        topicPolicies.setSubscriptionDispatchRate(dispatchRate);
+        return pulsar().getTopicPoliciesService().updateTopicPoliciesAsync(topicName, topicPolicies);
+    }
+
+    protected CompletableFuture<Void> internalRemoveSubscriptionDispatchRate() {
+        validateAdminAccessForTenant(namespaceName.getTenant());
+        validatePoliciesReadOnlyAccess();
+        if (topicName.isGlobal()) {
+            validateGlobalNamespaceOwnership(namespaceName);
+        }
+        checkTopicLevelPolicyEnable();
+        Optional<TopicPolicies> topicPolicies = getTopicPolicies(topicName);
+        if (!topicPolicies.isPresent()) {
+            return CompletableFuture.completedFuture(null);
+        }
+        topicPolicies.get().setSubscriptionDispatchRate(null);
+        return pulsar().getTopicPoliciesService().updateTopicPoliciesAsync(topicName, topicPolicies.get());
+    }
+
+
+    protected Optional<Integer> internalGetMaxConsumersPerSubscription() {
+        validateAdminAccessForTenant(namespaceName.getTenant());
+        validatePoliciesReadOnlyAccess();
+        if (topicName.isGlobal()) {
+            validateGlobalNamespaceOwnership(namespaceName);
+        }
+        checkTopicLevelPolicyEnable();
+        return getTopicPolicies(topicName).map(TopicPolicies::getMaxConsumersPerSubscription);
+    }
+
+    protected CompletableFuture<Void> internalSetMaxConsumersPerSubscription(Integer maxConsumersPerSubscription) {
+        if (maxConsumersPerSubscription != null && maxConsumersPerSubscription < 0) {
+            throw new RestException(Status.PRECONDITION_FAILED, "Invalid value for maxConsumersPerSubscription");
+        }
+        validateAdminAccessForTenant(namespaceName.getTenant());
+        validatePoliciesReadOnlyAccess();
+        if (topicName.isGlobal()) {
+            validateGlobalNamespaceOwnership(namespaceName);
+        }
+        checkTopicLevelPolicyEnable();
+
+        TopicPolicies topicPolicies = getTopicPolicies(topicName)
+                .orElseGet(TopicPolicies::new);
+        topicPolicies.setMaxConsumersPerSubscription(maxConsumersPerSubscription);
+        return pulsar().getTopicPoliciesService().updateTopicPoliciesAsync(topicName, topicPolicies);
+    }
+
+    protected CompletableFuture<Void> internalRemoveMaxConsumersPerSubscription() {
+        validateAdminAccessForTenant(namespaceName.getTenant());
+        validatePoliciesReadOnlyAccess();
+        if (topicName.isGlobal()) {
+            validateGlobalNamespaceOwnership(namespaceName);
+        }
+        checkTopicLevelPolicyEnable();
+        Optional<TopicPolicies> topicPolicies = getTopicPolicies(topicName);
+        if (!topicPolicies.isPresent()) {
+            return CompletableFuture.completedFuture(null);
+        }
+        topicPolicies.get().setMaxConsumersPerSubscription(null);
+        return pulsar().getTopicPoliciesService().updateTopicPoliciesAsync(topicName, topicPolicies.get());
+    }
+
+    protected Optional<Long> internalGetCompactionThreshold() {
+        validateAdminAccessForTenant(namespaceName.getTenant());
+        validatePoliciesReadOnlyAccess();
+        if (topicName.isGlobal()) {
+            validateGlobalNamespaceOwnership(namespaceName);
+        }
+        checkTopicLevelPolicyEnable();
+        return getTopicPolicies(topicName).map(TopicPolicies::getCompactionThreshold);
+    }
+
+    protected CompletableFuture<Void> internalSetCompactionThreshold(Long compactionThreshold) {
+        if (compactionThreshold != null && compactionThreshold < 0) {
+            throw new RestException(Status.PRECONDITION_FAILED, "Invalid value for compactionThreshold");
+        }
+        validateAdminAccessForTenant(namespaceName.getTenant());
+        validatePoliciesReadOnlyAccess();
+        if (topicName.isGlobal()) {
+            validateGlobalNamespaceOwnership(namespaceName);
+        }
+        checkTopicLevelPolicyEnable();
+
+        TopicPolicies topicPolicies = getTopicPolicies(topicName)
+            .orElseGet(TopicPolicies::new);
+        topicPolicies.setCompactionThreshold(compactionThreshold);
+        return pulsar().getTopicPoliciesService().updateTopicPoliciesAsync(topicName, topicPolicies);
+    }
+
+    protected CompletableFuture<Void> internalRemoveCompactionThreshold() {
+        validateAdminAccessForTenant(namespaceName.getTenant());
+        validatePoliciesReadOnlyAccess();
+        if (topicName.isGlobal()) {
+          validateGlobalNamespaceOwnership(namespaceName);
+        }
+        checkTopicLevelPolicyEnable();
+        Optional<TopicPolicies> topicPolicies = getTopicPolicies(topicName);
+        if (!topicPolicies.isPresent()) {
+          return CompletableFuture.completedFuture(null);
+        }
+        topicPolicies.get().setCompactionThreshold(null);
+        return pulsar().getTopicPoliciesService().updateTopicPoliciesAsync(topicName, topicPolicies.get());
+    }
+
+    protected Optional<PublishRate> internalGetPublishRate() {
+        validateAdminAccessForTenant(namespaceName.getTenant());
+        validatePoliciesReadOnlyAccess();
+        if (topicName.isGlobal()) {
+            validateGlobalNamespaceOwnership(namespaceName);
+        }
+        checkTopicLevelPolicyEnable();
+        return getTopicPolicies(topicName).map(TopicPolicies::getPublishRate);
+
+    }
+
+    protected CompletableFuture<Void> internalSetPublishRate(PublishRate publishRate) {
+        validateAdminAccessForTenant(namespaceName.getTenant());
+        validatePoliciesReadOnlyAccess();
+        if (topicName.isGlobal()) {
+            validateGlobalNamespaceOwnership(namespaceName);
+        }
+        checkTopicLevelPolicyEnable();
+        if (publishRate == null) {
+            return CompletableFuture.completedFuture(null);
+        }
+        TopicPolicies topicPolicies = getTopicPolicies(topicName)
+            .orElseGet(TopicPolicies::new);
+        topicPolicies.setPublishRate(publishRate);
+        return pulsar().getTopicPoliciesService().updateTopicPoliciesAsync(topicName, topicPolicies);
+    }
+
+    protected CompletableFuture<Void> internalRemovePublishRate() {
+        validateAdminAccessForTenant(namespaceName.getTenant());
+        validatePoliciesReadOnlyAccess();
+        if (topicName.isGlobal()) {
+            validateGlobalNamespaceOwnership(namespaceName);
+        }
+        checkTopicLevelPolicyEnable();
+        Optional<TopicPolicies> topicPolicies = getTopicPolicies(topicName);
+        if (!topicPolicies.isPresent()) {
+            return CompletableFuture.completedFuture(null);
+        }
+        topicPolicies.get().setPublishRate(null);
+        return pulsar().getTopicPoliciesService().updateTopicPoliciesAsync(topicName, topicPolicies.get());
+    }
+
+    protected Optional<SubscribeRate> internalGetSubscribeRate() {
+        validateAdminAccessForTenant(namespaceName.getTenant());
+        validatePoliciesReadOnlyAccess();
+        if (topicName.isGlobal()) {
+            validateGlobalNamespaceOwnership(namespaceName);
+        }
+
+        checkTopicLevelPolicyEnable();
+        return getTopicPolicies(topicName).map(TopicPolicies::getSubscribeRate);
+    }
+
+    protected CompletableFuture<Void> internalSetSubscribeRate(SubscribeRate subscribeRate) {
+        validateAdminAccessForTenant(namespaceName.getTenant());
+        validatePoliciesReadOnlyAccess();
+        if (topicName.isGlobal()) {
+            validateGlobalNamespaceOwnership(namespaceName);
+        }
+        checkTopicLevelPolicyEnable();
+        if (subscribeRate == null) {
+            return CompletableFuture.completedFuture(null);
+        }
+        TopicPolicies topicPolicies = getTopicPolicies(topicName)
+                .orElseGet(TopicPolicies::new);
+        topicPolicies.setSubscribeRate(subscribeRate);
+        return pulsar().getTopicPoliciesService().updateTopicPoliciesAsync(topicName, topicPolicies);
+    }
+
+    protected CompletableFuture<Void> internalRemoveSubscribeRate() {
+        validateAdminAccessForTenant(namespaceName.getTenant());
+        validatePoliciesReadOnlyAccess();
+        if (topicName.isGlobal()) {
+            validateGlobalNamespaceOwnership(namespaceName);
+        }
+        checkTopicLevelPolicyEnable();
+        Optional<TopicPolicies> topicPolicies = getTopicPolicies(topicName);
+        if (!topicPolicies.isPresent()) {
+            return CompletableFuture.completedFuture(null);
+        }
+        topicPolicies.get().setSubscribeRate(null);
+        return pulsar().getTopicPoliciesService().updateTopicPoliciesAsync(topicName, topicPolicies.get());
+    }
+
 }

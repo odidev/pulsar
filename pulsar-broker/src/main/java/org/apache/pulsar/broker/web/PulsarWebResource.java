@@ -145,7 +145,7 @@ public abstract class PulsarWebResource {
     }
 
     public boolean isRequestHttps() {
-    	return "https".equalsIgnoreCase(httpRequest.getScheme());
+        return "https".equalsIgnoreCase(httpRequest.getScheme());
     }
 
     public static boolean isClientAuthenticated(String appId) {
@@ -165,6 +165,15 @@ public abstract class PulsarWebResource {
                 throw new RestException(Status.UNAUTHORIZED, "Original principal cannot be a proxy role");
             }
         }
+    }
+
+    protected boolean hasSuperUserAccess() {
+        try {
+            validateSuperUserAccess();
+        } catch (Exception e) {
+            return false;
+        }
+        return true;
     }
 
     /**
@@ -203,6 +212,7 @@ public abstract class PulsarWebResource {
                                               appId, originalPrincipal));
                     }
                 } catch (InterruptedException | ExecutionException e) {
+                    log.error("Error validating super-user access : "+ e.getMessage(), e);
                     throw new RestException(Status.INTERNAL_SERVER_ERROR, e.getMessage());
                 }
                 log.debug("Successfully authorized {} (proxied by {}) as super-user",
@@ -308,8 +318,11 @@ public abstract class PulsarWebResource {
         try {
             tenantInfo = pulsar().getConfigurationCache().propertiesCache().get(path(POLICIES, tenant))
                     .orElseThrow(() -> new RestException(Status.NOT_FOUND, "Tenant does not exist"));
+        } catch (RestException e) {
+            log.warn("Failed to get tenant admin data for tenant {}", tenant);
+            throw e;
         } catch (Exception e) {
-            log.error("Failed to get tenant admin data for tenant");
+            log.error("Failed to get tenant admin data for tenant {}", tenant, e);
             throw new RestException(e);
         }
 
@@ -339,7 +352,6 @@ public abstract class PulsarWebResource {
                 // redirect to the cluster requested
                 if (log.isDebugEnabled()) {
                     log.debug("[{}] Redirecting the rest call to {}: cluster={}", clientAppId(), redirect, cluster);
-
                 }
                 throw new WebApplicationException(Response.temporaryRedirect(redirect).build());
             }
@@ -465,7 +477,7 @@ public abstract class PulsarWebResource {
     protected NamespaceBundle validateNamespaceBundleRange(NamespaceName fqnn, BundlesData bundles,
             String bundleRange) {
         try {
-            checkArgument(bundleRange.contains("_"), "Invalid bundle range");
+            checkArgument(bundleRange.contains("_"), "Invalid bundle range: " + bundleRange);
             String[] boundaries = bundleRange.split("_");
             Long lowerEndpoint = Long.decode(boundaries[0]);
             Long upperEndpoint = Long.decode(boundaries[1]);
@@ -477,6 +489,9 @@ public abstract class PulsarWebResource {
                     bundles);
             nsBundles.validateBundle(nsBundle);
             return nsBundle;
+        } catch (IllegalArgumentException e) {
+            log.error("[{}] Invalid bundle range {}/{}, {}", clientAppId(), fqnn.toString(), bundleRange, e.getMessage());
+            throw new RestException(Response.Status.PRECONDITION_FAILED, e.getMessage());
         } catch (Exception e) {
             log.error("[{}] Failed to validate namespace bundle {}/{}", clientAppId(), fqnn.toString(), bundleRange, e);
             throw new RestException(e);

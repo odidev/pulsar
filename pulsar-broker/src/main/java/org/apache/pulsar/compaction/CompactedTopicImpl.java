@@ -21,30 +21,30 @@ package org.apache.pulsar.compaction;
 import com.github.benmanes.caffeine.cache.AsyncLoadingCache;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.google.common.collect.ComparisonChain;
-
 import io.netty.buffer.ByteBuf;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Enumeration;
 import java.util.List;
 import java.util.NoSuchElementException;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
-
-import org.apache.bookkeeper.client.BookKeeper;
+import java.util.concurrent.ExecutionException;
+import lombok.Getter;
 import org.apache.bookkeeper.client.BKException;
-import org.apache.bookkeeper.client.LedgerHandle;
+import org.apache.bookkeeper.client.BookKeeper;
 import org.apache.bookkeeper.client.LedgerEntry;
+import org.apache.bookkeeper.client.LedgerHandle;
+import org.apache.bookkeeper.mledger.AsyncCallbacks.ReadEntriesCallback;
 import org.apache.bookkeeper.mledger.Entry;
 import org.apache.bookkeeper.mledger.ManagedCursor;
 import org.apache.bookkeeper.mledger.ManagedLedgerException;
 import org.apache.bookkeeper.mledger.Position;
-import org.apache.bookkeeper.mledger.AsyncCallbacks.ReadEntriesCallback;
 import org.apache.bookkeeper.mledger.impl.EntryImpl;
 import org.apache.bookkeeper.mledger.impl.PositionImpl;
 import org.apache.pulsar.client.api.RawMessage;
 import org.apache.pulsar.client.impl.RawMessageImpl;
 import org.apache.pulsar.common.api.proto.PulsarApi.MessageIdData;
-
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -250,7 +250,8 @@ public class CompactedTopicImpl implements CompactedTopic {
                 });
     }
 
-    static class CompactedTopicContext {
+    @Getter
+    public static class CompactedTopicContext {
         final LedgerHandle ledger;
         final AsyncLoadingCache<Long,MessageIdData> cache;
 
@@ -258,6 +259,14 @@ public class CompactedTopicImpl implements CompactedTopic {
             this.ledger = ledger;
             this.cache = cache;
         }
+    }
+
+    /**
+     * Getter for CompactedTopicContext.
+     * @return CompactedTopicContext
+     */
+    public Optional<CompactedTopicContext> getCompactedTopicContext() throws ExecutionException, InterruptedException {
+        return compactedTopicContext == null? Optional.empty() : Optional.of(compactedTopicContext.get());
     }
 
     private static int comparePositionAndMessageId(PositionImpl p, MessageIdData m) {

@@ -49,6 +49,26 @@ public class TopicPolicies {
     private Integer maxUnackedMessagesOnSubscription = null;
     private Long delayedDeliveryTickTimeMillis = null;
     private Boolean delayedDeliveryEnabled = null;
+    private OffloadPolicies offloadPolicies;
+    private InactiveTopicPolicies inactiveTopicPolicies = null;
+    private DispatchRate dispatchRate = null;
+    private DispatchRate subscriptionDispatchRate = null;
+    private Long compactionThreshold = null;
+    private PublishRate publishRate = null;
+    private SubscribeRate subscribeRate = null;
+    private Integer deduplicationSnapshotIntervalSeconds = null;
+
+    public boolean isDeduplicationSnapshotIntervalSecondsSet(){
+        return deduplicationSnapshotIntervalSeconds != null;
+    }
+
+    public boolean isInactiveTopicPoliciesSet() {
+        return inactiveTopicPolicies != null;
+    }
+
+    public boolean isOffloadPoliciesSet() {
+        return offloadPolicies != null;
+    }
 
     public boolean isMaxUnackedMessagesOnConsumerSet() {
         return maxUnackedMessagesOnConsumer != null;
@@ -96,5 +116,25 @@ public class TopicPolicies {
 
     public boolean isMaxConsumersPerSubscriptionSet() {
         return maxConsumersPerSubscription != null;
+    }
+
+    public boolean isDispatchRateSet() {
+        return dispatchRate != null;
+    }
+
+    public boolean isSubscriptionDispatchRateSet() {
+        return subscriptionDispatchRate != null;
+    }
+
+    public boolean isCompactionThresholdSet() {
+        return compactionThreshold != null;
+    }
+
+    public boolean isPublishRateSet() {
+        return publishRate != null;
+    }
+
+    public boolean isSubscribeRateSet() {
+        return subscribeRate != null;
     }
 }

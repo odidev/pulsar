@@ -21,12 +21,18 @@ package org.apache.pulsar.client.api;
 import java.nio.ByteBuffer;
 import java.sql.Time;
 import java.sql.Timestamp;
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.LocalTime;
 import java.util.Date;
 import org.apache.pulsar.client.api.schema.GenericRecord;
 import org.apache.pulsar.client.api.schema.GenericSchema;
 import org.apache.pulsar.client.api.schema.SchemaDefinition;
 import org.apache.pulsar.client.api.schema.SchemaInfoProvider;
 import org.apache.pulsar.client.internal.DefaultImplementation;
+import org.apache.pulsar.common.classification.InterfaceAudience;
+import org.apache.pulsar.common.classification.InterfaceStability;
 import org.apache.pulsar.common.schema.KeyValue;
 import org.apache.pulsar.common.schema.KeyValueEncodingType;
 import org.apache.pulsar.common.schema.SchemaInfo;
@@ -35,6 +41,8 @@ import org.apache.pulsar.common.schema.SchemaType;
 /**
  * Message schema definition.
  */
+@InterfaceAudience.Public
+@InterfaceStability.Stable
 public interface Schema<T> extends Cloneable{
 
     /**
@@ -207,6 +215,23 @@ public interface Schema<T> extends Cloneable{
      * Timestamp Schema.
      */
     Schema<Timestamp> TIMESTAMP = DefaultImplementation.newTimestampSchema();
+
+    /**
+     * Instant Schema.
+     */
+    Schema<Instant> INSTANT = DefaultImplementation.newInstantSchema();
+    /**
+     * LocalDate Schema.
+     */
+    Schema<LocalDate> LOCAL_DATE = DefaultImplementation.newLocalDateSchema();
+    /**
+     * LocalTime Schema.
+     */
+    Schema<LocalTime> LOCAL_TIME = DefaultImplementation.newLocalTimeSchema();
+    /**
+     * LocalDateTime Schema.
+     */
+    Schema<LocalDateTime> LOCAL_DATE_TIME = DefaultImplementation.newLocalDateTimeSchema();
 
     // CHECKSTYLE.OFF: MethodName
 

@@ -40,6 +40,8 @@ import javax.ws.rs.container.AsyncResponse;
 import javax.ws.rs.core.Response;
 import javax.ws.rs.core.Response.Status;
 import javax.ws.rs.core.UriBuilder;
+
+import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import org.apache.bookkeeper.util.ZkUtils;
 import org.apache.pulsar.broker.PulsarService;
 import org.apache.pulsar.broker.ServiceConfiguration;
@@ -366,6 +368,7 @@ public abstract class AdminResource extends PulsarWebResource {
                 throw new RestException(Status.CONFLICT, "Topic is not partitioned topic");
             }
         } catch ( InterruptedException  | ExecutionException e) {
+            log.error("Failed to validate partitioned topic metadata {}://{}/{}/{}", domain(), tenant, namespace, topicName, e);
             throw new RestException(Status.INTERNAL_SERVER_ERROR, "Check topic partition meta failed.");
         }
     }
@@ -501,7 +504,7 @@ public abstract class AdminResource extends PulsarWebResource {
             policies.clusterSubscribeRate.put(cluster, subscribeRate());
         }
 
-        if (policies.message_ttl_in_seconds <= 0) {
+        if (policies.message_ttl_in_seconds == null) {
             policies.message_ttl_in_seconds = config.getTtlDurationDefaultInSeconds();
         }
     }
@@ -879,6 +882,11 @@ public abstract class AdminResource extends PulsarWebResource {
         } else {
             asyncResponse.resume(new RestException(throwable));
         }
+    }
+
+    @CanIgnoreReturnValue
+    public static <T> T checkNotNull(T reference) {
+        return com.google.common.base.Preconditions.checkNotNull(reference);
     }
 
     protected void checkNotNull(Object o, String errorMessage) {

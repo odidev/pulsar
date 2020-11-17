@@ -268,8 +268,7 @@ public class ProducerImpl<T> extends ProducerBase<T> implements TimerTask, Conne
     }
 
     @Override
-    CompletableFuture<MessageId> internalSendAsync(Message<?> message, Transaction txn) {
-
+    CompletableFuture<MessageId> internalSendAsync(Message<?> message) {
         CompletableFuture<MessageId> future = new CompletableFuture<>();
 
         MessageImpl<?> interceptorMessage = (MessageImpl) beforeSend(message);
@@ -343,10 +342,17 @@ public class ProducerImpl<T> extends ProducerBase<T> implements TimerTask, Conne
                 nextCallback = scb;
             }
         });
-        if (txn instanceof TransactionImpl) {
-            ((TransactionImpl) txn).registerProducedTopic(topic);
-        }
         return future;
+    }
+
+    @Override
+    CompletableFuture<MessageId> internalSendWithTxnAsync(Message<?> message, Transaction txn) {
+        if (txn == null) {
+            return internalSendAsync(message);
+        } else {
+            return ((TransactionImpl) txn).registerProducedTopic(topic)
+                        .thenCompose(ignored -> internalSendAsync(message));
+        }
     }
 
     public void sendAsync(Message<?> message, SendCallback callback) {
@@ -671,7 +677,8 @@ public class ProducerImpl<T> extends ProducerBase<T> implements TimerTask, Conne
 
     private boolean canAddToCurrentBatch(MessageImpl<?> msg) {
         return batchMessageContainer.haveEnoughSpace(msg)
-               && (!isMultiSchemaEnabled(false) || batchMessageContainer.hasSameSchema(msg));
+               && (!isMultiSchemaEnabled(false) || batchMessageContainer.hasSameSchema(msg))
+                && batchMessageContainer.hasSameTxn(msg);
     }
 
     private void doBatchSendAndAdd(MessageImpl<?> msg, SendCallback callback, ByteBuf payload) {
@@ -1311,6 +1318,11 @@ public class ProducerImpl<T> extends ProducerBase<T> implements TimerTask, Conne
                         setState(State.Failed);
                         producerCreatedFuture.completeExceptionally(cause);
                         client.cleanupProducer(this);
+                        Timeout timeout = sendTimeout;
+                        if (timeout != null) {
+                            timeout.cancel();
+                            sendTimeout = null;
+                        }
                     }
 
                     return null;

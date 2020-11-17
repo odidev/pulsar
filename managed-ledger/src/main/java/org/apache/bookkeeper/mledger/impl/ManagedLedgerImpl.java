@@ -465,34 +465,70 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
                     return;
                 }
 
-                for (final String cursorName : consumers) {
-                    if (log.isDebugEnabled()) {
-                        log.debug("[{}] Loading cursor {}", name, cursorName);
-                    }
-                    final ManagedCursorImpl cursor;
-                    cursor = new ManagedCursorImpl(bookKeeper, config, ManagedLedgerImpl.this, cursorName);
+                if (!ManagedLedgerImpl.this.config.isLazyCursorRecovery()) {
+                    log.debug("[{}] Loading cursor {}", name);
 
-                    cursor.recover(new VoidCallback() {
-                        @Override
-                        public void operationComplete() {
-                            log.info("[{}] Recovery for cursor {} completed. pos={} -- todo={}", name, cursorName,
-                                    cursor.getMarkDeletedPosition(), cursorCount.get() - 1);
-                            cursor.setActive();
-                            cursors.add(cursor);
+                    for (final String cursorName : consumers) {
+                        log.info("[{}] Loading cursor {}", name, cursorName);
+                        final ManagedCursorImpl cursor;
+                        cursor = new ManagedCursorImpl(bookKeeper, config, ManagedLedgerImpl.this, cursorName);
 
-                            if (cursorCount.decrementAndGet() == 0) {
-                                // The initialization is now completed, register the jmx mbean
-                                callback.initializeComplete();
+                        cursor.recover(new VoidCallback() {
+                            @Override
+                            public void operationComplete() {
+                                log.info("[{}] Recovery for cursor {} completed. pos={} -- todo={}", name, cursorName,
+                                        cursor.getMarkDeletedPosition(), cursorCount.get() - 1);
+                                cursor.setActive();
+                                cursors.add(cursor);
+
+                                if (cursorCount.decrementAndGet() == 0) {
+                                    // The initialization is now completed, register the jmx mbean
+                                    callback.initializeComplete();
+                                }
                             }
-                        }
 
-                        @Override
-                        public void operationFailed(ManagedLedgerException exception) {
-                            log.warn("[{}] Recovery for cursor {} failed", name, cursorName, exception);
-                            cursorCount.set(-1);
-                            callback.initializeFailed(exception);
+                            @Override
+                            public void operationFailed(ManagedLedgerException exception) {
+                                log.warn("[{}] Recovery for cursor {} failed", name, cursorName, exception);
+                                cursorCount.set(-1);
+                                callback.initializeFailed(exception);
+                            }
+                        });
+                    }
+                } else {
+                    // Lazily recover cursors by put them to uninitializedCursors map.
+                    for (final String cursorName : consumers) {
+                        if (log.isDebugEnabled()) {
+                            log.debug("[{}] Recovering cursor {} lazily" , name, cursorName);
                         }
-                    });
+                        final ManagedCursorImpl cursor;
+                        cursor = new ManagedCursorImpl(bookKeeper, config, ManagedLedgerImpl.this, cursorName);
+                        CompletableFuture<ManagedCursor> cursorRecoveryFuture = new CompletableFuture<>();
+                        uninitializedCursors.put(cursorName, cursorRecoveryFuture);
+
+                        cursor.recover(new VoidCallback() {
+                            @Override
+                            public void operationComplete() {
+                                log.info("[{}] Lazy recovery for cursor {} completed. pos={} -- todo={}", name, cursorName,
+                                        cursor.getMarkDeletedPosition(), cursorCount.get() - 1);
+                                cursor.setActive();
+                                synchronized (ManagedLedgerImpl.this) {
+                                    cursors.add(cursor);
+                                    uninitializedCursors.remove(cursor.getName()).complete(cursor);
+                                }
+                            }
+
+                            @Override
+                            public void operationFailed(ManagedLedgerException exception) {
+                                log.warn("[{}] Lazy recovery for cursor {} failed", name, cursorName, exception);
+                                synchronized (ManagedLedgerImpl.this) {
+                                    uninitializedCursors.remove(cursor.getName()).completeExceptionally(exception);
+                                }
+                            }
+                        });
+                    }
+                    // Complete ledger recovery.
+                    callback.initializeComplete();
                 }
             }
 
@@ -601,7 +637,8 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
                 long elapsedMs = System.currentTimeMillis() - this.lastLedgerCreationInitiationTimestamp;
                 if (elapsedMs > TimeUnit.SECONDS.toMillis(2 * config.getMetadataOperationsTimeoutSeconds())) {
                     log.info("[{}] Ledger creation was initiated {} ms ago but it never completed" +
-                        " and creation timeout task didn't kick in as well. Force to fail the create ledger operation ...");
+                        " and creation timeout task didn't kick in as well. Force to fail the create ledger operation.",
+                            name, elapsedMs);
                     this.createComplete(Code.TimeoutException, null, null);
                 }
             }
@@ -1477,6 +1514,10 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
         }
     }
 
+    public CompletableFuture<String> getLedgerMetadata(long ledgerId) {
+        return getLedgerHandle(ledgerId).thenApply(rh -> rh.getLedgerMetadata().toSafeString());
+    }
+
     CompletableFuture<ReadHandle> getLedgerHandle(long ledgerId) {
         CompletableFuture<ReadHandle> ledgerHandle = ledgerCache.get(ledgerId);
         if (ledgerHandle != null) {
@@ -1555,11 +1596,9 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
     }
 
     private void internalReadFromLedger(ReadHandle ledger, OpReadEntry opReadEntry) {
-
         // Perform the read
         long firstEntry = opReadEntry.readPosition.getEntryId();
         long lastEntryInLedger;
-        final ManagedCursorImpl cursor = opReadEntry.cursor;
 
         PositionImpl lastPosition = lastConfirmedEntry;
 
@@ -1587,6 +1626,8 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
                 } else {
                     opReadEntry.updateReadPosition(new PositionImpl(ledger.getId() + 1, 0));
                 }
+            } else {
+                opReadEntry.updateReadPosition(opReadEntry.readPosition);
             }
 
             opReadEntry.checkReadCompletion();
@@ -1888,11 +1929,12 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
     }
 
     private void maybeOffloadInBackground(CompletableFuture<PositionImpl> promise) {
-        if (config.getLedgerOffloader() != null && config.getLedgerOffloader() != NullLedgerOffloader.INSTANCE
-                && config.getLedgerOffloader().getOffloadPolicies() != null) {
-            if (config.getLedgerOffloader().getOffloadPolicies().getManagedLedgerOffloadThresholdInBytes() >= 0) {
-                executor.executeOrdered(name, safeRun(() -> maybeOffload(promise)));
-            }
+        if (config.getLedgerOffloader() != null
+                && config.getLedgerOffloader() != NullLedgerOffloader.INSTANCE
+                && config.getLedgerOffloader().getOffloadPolicies() != null
+                && config.getLedgerOffloader().getOffloadPolicies().getManagedLedgerOffloadThresholdInBytes() != null
+                && config.getLedgerOffloader().getOffloadPolicies().getManagedLedgerOffloadThresholdInBytes() >= 0) {
+            executor.executeOrdered(name, safeRun(() -> maybeOffload(promise)));
         }
     }
 
@@ -1911,8 +1953,10 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
                     }
                 });
 
-            if (config.getLedgerOffloader() != null && config.getLedgerOffloader() != NullLedgerOffloader.INSTANCE
-                    && config.getLedgerOffloader().getOffloadPolicies() != null) {
+            if (config.getLedgerOffloader() != null
+                    && config.getLedgerOffloader() != NullLedgerOffloader.INSTANCE
+                    && config.getLedgerOffloader().getOffloadPolicies() != null
+                    && config.getLedgerOffloader().getOffloadPolicies().getManagedLedgerOffloadThresholdInBytes() != null) {
                 long threshold = config.getLedgerOffloader().getOffloadPolicies().getManagedLedgerOffloadThresholdInBytes();
 
                 long sizeSummed = 0;
